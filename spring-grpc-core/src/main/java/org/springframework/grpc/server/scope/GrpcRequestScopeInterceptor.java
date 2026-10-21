@@ -16,8 +16,9 @@
 
 package org.springframework.grpc.server.scope;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.Iterator;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -38,33 +39,28 @@ import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 
 /**
- * A {@link Scope} that lasts for the duration of a gRPC call. Register it as a
- * {@link org.springframework.grpc.server.GlobalServerInterceptor global server
- * interceptor} bean: it registers itself with the bean factory under the
- * {@value #SCOPE_NAME} scope name and opens a new scope for every call it intercepts,
- * ahead of all other interceptors. Beans in this scope are created on first use within a
+ * A server interceptor that provides a {@link Scope} lasting for the duration of a gRPC
+ * call. Register it as a {@link org.springframework.grpc.server.GlobalServerInterceptor
+ * global server interceptor} bean: it registers the {@value #SCOPE_NAME} scope with the
+ * bean factory and opens a new scope for every call it intercepts, ahead of the other
+ * interceptors in the service chain. Beans in the scope are created on first use within a
  * call, are shared by all threads to which the call's {@link Context gRPC context} is
- * propagated, and are destroyed when the call completes or is cancelled.
+ * propagated, and are destroyed when the call's context is cancelled, that is when the
+ * call completes or is cancelled, on the thread that completes the call.
  * <p>
- * Annotate beans with {@link GrpcRequestScope @GrpcRequestScope} to place them in this
+ * Annotate beans with {@link GrpcRequestScope @GrpcRequestScope} to place them in the
  * scope.
  *
  * @author Sharang Gupta
  * @since 1.1.2
  * @see GrpcRequestScope
  */
-public class GrpcRequestScopeInterceptor implements Scope, ServerInterceptor, BeanFactoryPostProcessor, Ordered {
+public class GrpcRequestScopeInterceptor implements ServerInterceptor, BeanFactoryPostProcessor, Ordered {
 
 	/**
 	 * The name of the scope.
 	 */
 	public static final String SCOPE_NAME = "grpcRequest";
-
-	/**
-	 * The order of the interceptor: it runs before all other interceptors so that scoped
-	 * beans are available to them.
-	 */
-	public static final int ORDER = Ordered.HIGHEST_PRECEDENCE;
 
 	private static final Log logger = LogFactory.getLog(GrpcRequestScopeInterceptor.class);
 
@@ -72,12 +68,16 @@ public class GrpcRequestScopeInterceptor implements Scope, ServerInterceptor, Be
 
 	@Override
 	public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
-		beanFactory.registerScope(SCOPE_NAME, this);
+		beanFactory.registerScope(SCOPE_NAME, new RequestScope());
 	}
 
+	/**
+	 * Runs before the other interceptors in the chain so that scoped beans are available
+	 * to them.
+	 */
 	@Override
 	public int getOrder() {
-		return ORDER;
+		return Ordered.HIGHEST_PRECEDENCE;
 	}
 
 	@Override
@@ -87,31 +87,6 @@ public class GrpcRequestScopeInterceptor implements Scope, ServerInterceptor, Be
 		Context context = Context.current().withValue(SCOPED_BEANS, scopedBeans);
 		context.addListener((cancelled) -> scopedBeans.destroy(), Runnable::run);
 		return Contexts.interceptCall(context, call, headers, next);
-	}
-
-	@Override
-	public Object get(String name, ObjectFactory<?> objectFactory) {
-		return currentScopedBeans().get(name, objectFactory);
-	}
-
-	@Override
-	public @Nullable Object remove(String name) {
-		return currentScopedBeans().remove(name);
-	}
-
-	@Override
-	public void registerDestructionCallback(String name, Runnable callback) {
-		currentScopedBeans().registerDestructionCallback(name, callback);
-	}
-
-	@Override
-	public @Nullable Object resolveContextualObject(String key) {
-		return null;
-	}
-
-	@Override
-	public @Nullable String getConversationId() {
-		return null;
 	}
 
 	private static ScopedBeans currentScopedBeans() {
@@ -124,47 +99,138 @@ public class GrpcRequestScopeInterceptor implements Scope, ServerInterceptor, Be
 	}
 
 	/**
-	 * The beans of one call together with their destruction callbacks.
+	 * The scope registered with the bean factory, backed by the beans of the current
+	 * call.
+	 */
+	private static final class RequestScope implements Scope {
+
+		@Override
+		public Object get(String name, ObjectFactory<?> objectFactory) {
+			return currentScopedBeans().get(name, objectFactory);
+		}
+
+		@Override
+		public @Nullable Object remove(String name) {
+			return currentScopedBeans().remove(name);
+		}
+
+		@Override
+		public void registerDestructionCallback(String name, Runnable callback) {
+			currentScopedBeans().registerDestructionCallback(name, callback);
+		}
+
+		@Override
+		public @Nullable Object resolveContextualObject(String key) {
+			return null;
+		}
+
+		@Override
+		public @Nullable String getConversationId() {
+			return null;
+		}
+
+	}
+
+	/**
+	 * The beans of one call. Creation is serialized per bean name, not per call, and
+	 * nothing can be looked up once the call's beans have been destroyed.
 	 */
 	private static final class ScopedBeans {
 
-		private final Map<String, Object> beans = new LinkedHashMap<>();
+		private final ConcurrentMap<String, ScopedBean> beans = new ConcurrentHashMap<>();
 
-		private final Map<String, Runnable> destructionCallbacks = new LinkedHashMap<>();
+		private volatile boolean destroyed;
 
-		synchronized Object get(String name, ObjectFactory<?> objectFactory) {
-			Object bean = this.beans.get(name);
-			if (bean == null) {
-				bean = objectFactory.getObject();
-				this.beans.put(name, bean);
+		Object get(String name, ObjectFactory<?> objectFactory) {
+			assertNotDestroyed();
+			ScopedBean bean = this.beans.computeIfAbsent(name, (key) -> new ScopedBean(key, objectFactory));
+			Object instance = bean.get();
+			if (this.destroyed) {
+				// Lost the race against the end of the call: nothing may outlive it.
+				ScopedBean late = this.beans.remove(name);
+				if (late != null) {
+					late.destroy();
+				}
+				assertNotDestroyed();
 			}
-			return bean;
+			return instance;
 		}
 
-		synchronized @Nullable Object remove(String name) {
-			this.destructionCallbacks.remove(name);
-			return this.beans.remove(name);
+		@Nullable
+		Object remove(String name) {
+			ScopedBean bean = this.beans.remove(name);
+			return (bean != null) ? bean.getIfCreated() : null;
 		}
 
-		synchronized void registerDestructionCallback(String name, Runnable callback) {
-			this.destructionCallbacks.put(name, callback);
+		void registerDestructionCallback(String name, Runnable callback) {
+			ScopedBean bean = this.beans.get(name);
+			if (bean != null) {
+				bean.setDestructionCallback(callback);
+			}
 		}
 
 		void destroy() {
-			Map<String, Runnable> callbacks;
-			synchronized (this) {
-				callbacks = new LinkedHashMap<>(this.destructionCallbacks);
-				this.destructionCallbacks.clear();
-				this.beans.clear();
+			this.destroyed = true;
+			Iterator<ScopedBean> iterator = this.beans.values().iterator();
+			while (iterator.hasNext()) {
+				ScopedBean bean = iterator.next();
+				iterator.remove();
+				bean.destroy();
 			}
-			callbacks.forEach((name, callback) -> {
+		}
+
+		private void assertNotDestroyed() {
+			Assert.state(!this.destroyed,
+					() -> "The gRPC call has completed and its " + SCOPE_NAME + " scoped beans have been destroyed");
+		}
+
+	}
+
+	/**
+	 * One bean of a call, created on first access and destroyed at most once.
+	 */
+	private static final class ScopedBean {
+
+		private final String name;
+
+		private final ObjectFactory<?> objectFactory;
+
+		private @Nullable Object instance;
+
+		private @Nullable Runnable destructionCallback;
+
+		ScopedBean(String name, ObjectFactory<?> objectFactory) {
+			this.name = name;
+			this.objectFactory = objectFactory;
+		}
+
+		synchronized Object get() {
+			if (this.instance == null) {
+				this.instance = this.objectFactory.getObject();
+			}
+			return this.instance;
+		}
+
+		synchronized @Nullable Object getIfCreated() {
+			return this.instance;
+		}
+
+		synchronized void setDestructionCallback(Runnable callback) {
+			this.destructionCallback = callback;
+		}
+
+		synchronized void destroy() {
+			Runnable callback = this.destructionCallback;
+			this.destructionCallback = null;
+			this.instance = null;
+			if (callback != null) {
 				try {
 					callback.run();
 				}
 				catch (Throwable ex) {
-					logger.error("Destruction callback of gRPC request scoped bean '" + name + "' failed", ex);
+					logger.error("Destruction callback of gRPC request scoped bean '" + this.name + "' failed", ex);
 				}
-			});
+			}
 		}
 
 	}

@@ -26,6 +26,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 import org.awaitility.Awaitility;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -36,8 +37,11 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
 import org.springframework.grpc.server.GlobalServerInterceptor;
+import org.springframework.grpc.server.service.DefaultGrpcServiceConfigurer;
+import org.springframework.grpc.server.service.GrpcServiceSpec;
 
 import com.google.protobuf.Empty;
+import io.grpc.BindableService;
 import io.grpc.CallOptions;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
@@ -45,9 +49,11 @@ import io.grpc.MethodDescriptor;
 import io.grpc.Server;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
+import io.grpc.ServerInterceptor;
 import io.grpc.ServerInterceptors;
 import io.grpc.ServerServiceDefinition;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.protobuf.ProtoUtils;
@@ -69,72 +75,141 @@ class GrpcRequestScopeInterceptorTests {
 		.setResponseMarshaller(ProtoUtils.marshaller(Empty.getDefaultInstance()))
 		.build();
 
+	private final List<String> observedIds = new CopyOnWriteArrayList<>();
+
+	private AnnotationConfigApplicationContext context;
+
+	private CallState callState;
+
 	@BeforeEach
-	void clearDestroyedBeans() {
+	void createContext() {
 		CallState.destroyed.clear();
+		this.context = new AnnotationConfigApplicationContext(ScopeConfiguration.class);
+		this.callState = this.context.getBean(CallState.class);
+	}
+
+	@AfterEach
+	void closeContext() {
+		this.context.close();
 	}
 
 	@Test
 	void scopedBeanIsCreatedPerCallAndDestroyedWhenTheCallCompletes() throws Exception {
-		try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(
-				ScopeConfiguration.class)) {
-			GrpcRequestScopeInterceptor scope = context.getBean(GrpcRequestScopeInterceptor.class);
-			CallState callState = context.getBean(CallState.class);
-			List<String> observedIds = new CopyOnWriteArrayList<>();
-			ServerCallHandler<Empty, Empty> handler = (call, headers) -> {
-				call.request(1);
-				return new ServerCall.Listener<>() {
-					@Override
-					public void onHalfClose() {
-						observedIds.add(callState.getId());
-						observedIds.add(callState.getId());
-						call.sendHeaders(new Metadata());
-						call.sendMessage(Empty.getDefaultInstance());
-						call.close(Status.OK, new Metadata());
-					}
-				};
+		ServerCallHandler<Empty, Empty> handler = (call, headers) -> {
+			call.request(1);
+			return new ServerCall.Listener<>() {
+				@Override
+				public void onHalfClose() {
+					observedIds.add(callState.getId());
+					observedIds.add(callState.getId());
+					call.sendHeaders(new Metadata());
+					call.sendMessage(Empty.getDefaultInstance());
+					call.close(Status.OK, new Metadata());
+				}
 			};
-			ServerServiceDefinition service = ServerServiceDefinition.builder(SERVICE_NAME)
-				.addMethod(METHOD, handler)
-				.build();
-			String serverName = InProcessServerBuilder.generateName();
-			Server server = InProcessServerBuilder.forName(serverName)
-				.directExecutor()
-				.addService(ServerInterceptors.interceptForward(service, scope))
-				.build()
-				.start();
-			ManagedChannel channel = InProcessChannelBuilder.forName(serverName).directExecutor().build();
-			try {
-				CallOptions options = CallOptions.DEFAULT.withDeadlineAfter(5, TimeUnit.SECONDS);
-				ClientCalls.blockingUnaryCall(channel, METHOD, options, Empty.getDefaultInstance());
-				ClientCalls.blockingUnaryCall(channel, METHOD, options, Empty.getDefaultInstance());
-			}
-			finally {
-				channel.shutdownNow();
-				server.shutdownNow();
-			}
-			assertThat(observedIds).hasSize(4);
-			assertThat(observedIds.get(1)).isEqualTo(observedIds.get(0));
-			assertThat(observedIds.get(3)).isEqualTo(observedIds.get(2)).isNotEqualTo(observedIds.get(0));
-			Awaitility.await()
-				.atMost(Duration.ofSeconds(5))
-				.untilAsserted(() -> assertThat(CallState.destroyed).containsExactlyInAnyOrder(observedIds.get(0),
-						observedIds.get(2)));
-		}
+		};
+		withServer(handler, (channel) -> {
+			CallOptions options = CallOptions.DEFAULT.withDeadlineAfter(5, TimeUnit.SECONDS);
+			ClientCalls.blockingUnaryCall(channel, METHOD, options, Empty.getDefaultInstance());
+			ClientCalls.blockingUnaryCall(channel, METHOD, options, Empty.getDefaultInstance());
+		});
+		assertThat(this.observedIds).hasSize(4);
+		assertThat(this.observedIds.get(1)).isEqualTo(this.observedIds.get(0));
+		assertThat(this.observedIds.get(3)).isEqualTo(this.observedIds.get(2)).isNotEqualTo(this.observedIds.get(0));
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(5))
+			.untilAsserted(() -> assertThat(CallState.destroyed).containsExactlyInAnyOrder(this.observedIds.get(0),
+					this.observedIds.get(2)));
+	}
+
+	@Test
+	void scopedBeanIsDestroyedWhenTheCallIsCancelled() throws Exception {
+		ServerCallHandler<Empty, Empty> handler = (call, headers) -> {
+			call.request(1);
+			return new ServerCall.Listener<>() {
+				@Override
+				public void onHalfClose() {
+					observedIds.add(callState.getId());
+					// never respond, so the client's deadline cancels the call
+				}
+			};
+		};
+		withServer(handler, (channel) -> {
+			CallOptions options = CallOptions.DEFAULT.withDeadlineAfter(200, TimeUnit.MILLISECONDS);
+			assertThatThrownBy(
+					() -> ClientCalls.blockingUnaryCall(channel, METHOD, options, Empty.getDefaultInstance()))
+				.isInstanceOf(StatusRuntimeException.class);
+		});
+		assertThat(this.observedIds).hasSize(1);
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(5))
+			.untilAsserted(() -> assertThat(CallState.destroyed).containsExactly(this.observedIds.get(0)));
+	}
+
+	@Test
+	void scopeIsOpenForTheOtherGlobalInterceptors() throws Exception {
+		ServerCallHandler<Empty, Empty> handler = (call, headers) -> {
+			call.request(1);
+			return new ServerCall.Listener<>() {
+				@Override
+				public void onHalfClose() {
+					observedIds.add(callState.getId());
+					call.sendHeaders(new Metadata());
+					call.sendMessage(Empty.getDefaultInstance());
+					call.close(Status.OK, new Metadata());
+				}
+			};
+		};
+		BindableService service = () -> ServerServiceDefinition.builder(SERVICE_NAME)
+			.addMethod(METHOD, handler)
+			.build();
+		DefaultGrpcServiceConfigurer configurer = new DefaultGrpcServiceConfigurer(this.context);
+		configurer.afterPropertiesSet();
+		ServerServiceDefinition configured = configurer.configure(new GrpcServiceSpec(service, null), null);
+		withService(configured, (channel) -> {
+			CallOptions options = CallOptions.DEFAULT.withDeadlineAfter(5, TimeUnit.SECONDS);
+			ClientCalls.blockingUnaryCall(channel, METHOD, options, Empty.getDefaultInstance());
+		});
+		ScopeProbeInterceptor probe = this.context.getBean(ScopeProbeInterceptor.class);
+		assertThat(probe.seenIds).containsExactlyElementsOf(this.observedIds);
 	}
 
 	@Test
 	void scopeIsNotActiveOutsideOfACall() {
-		try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(
-				ScopeConfiguration.class)) {
-			CallState callState = context.getBean(CallState.class);
-			assertThatThrownBy(callState::getId).isInstanceOf(ScopeNotActiveException.class);
-		}
+		assertThatThrownBy(this.callState::getId).isInstanceOf(ScopeNotActiveException.class);
 	}
 
 	@Test
 	void interceptorRunsBeforeAllOtherInterceptors() {
 		assertThat(new GrpcRequestScopeInterceptor().getOrder()).isEqualTo(Ordered.HIGHEST_PRECEDENCE);
+	}
+
+	private void withServer(ServerCallHandler<Empty, Empty> handler, ChannelCallback callback) throws Exception {
+		ServerServiceDefinition service = ServerServiceDefinition.builder(SERVICE_NAME)
+			.addMethod(METHOD, handler)
+			.build();
+		GrpcRequestScopeInterceptor scope = this.context.getBean(GrpcRequestScopeInterceptor.class);
+		withService(ServerInterceptors.interceptForward(service, scope), callback);
+	}
+
+	private void withService(ServerServiceDefinition service, ChannelCallback callback) throws Exception {
+		String serverName = InProcessServerBuilder.generateName();
+		Server server = InProcessServerBuilder.forName(serverName).directExecutor().addService(service).build().start();
+		ManagedChannel channel = InProcessChannelBuilder.forName(serverName).directExecutor().build();
+		try {
+			callback.call(channel);
+		}
+		finally {
+			channel.shutdownNow();
+			server.shutdownNow();
+		}
+	}
+
+	@FunctionalInterface
+	private interface ChannelCallback {
+
+		void call(ManagedChannel channel) throws Exception;
+
 	}
 
 	@Configuration(proxyBeanMethods = false)
@@ -147,9 +222,38 @@ class GrpcRequestScopeInterceptorTests {
 		}
 
 		@Bean
+		@GlobalServerInterceptor
+		ScopeProbeInterceptor scopeProbeInterceptor(CallState callState) {
+			return new ScopeProbeInterceptor(callState);
+		}
+
+		@Bean
 		@GrpcRequestScope
 		CallState callState() {
 			return new CallState();
+		}
+
+	}
+
+	/**
+	 * A global interceptor with the default (lowest) precedence that reads the scoped
+	 * bean of the call it intercepts.
+	 */
+	static class ScopeProbeInterceptor implements ServerInterceptor {
+
+		final List<String> seenIds = new CopyOnWriteArrayList<>();
+
+		private final CallState callState;
+
+		ScopeProbeInterceptor(CallState callState) {
+			this.callState = callState;
+		}
+
+		@Override
+		public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call, Metadata headers,
+				ServerCallHandler<ReqT, RespT> next) {
+			this.seenIds.add(this.callState.getId());
+			return next.startCall(call, headers);
 		}
 
 	}

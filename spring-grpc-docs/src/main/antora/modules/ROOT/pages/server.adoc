@@ -157,14 +157,15 @@ However, by setting the `blendWithGlobalInterceptors` attribute on the javadoc:o
 You can use this option if you want to add a per-service interceptor between global interceptors.
 ====
 
-[[reflection-service]]
+[[request-scoped-beans]]
 == Request Scoped Beans
 
 Beans can be scoped to a single gRPC call with the javadoc:org.springframework.grpc.server.scope.GrpcRequestScope[format=annotation] annotation.
 A bean in this scope is created once per call on first use, is shared by every thread to which the call's `io.grpc.Context` is propagated, and is destroyed when the call completes or is cancelled.
 
 To activate the scope, register a javadoc:org.springframework.grpc.server.scope.GrpcRequestScopeInterceptor[] bean as a global server interceptor.
-It registers the `grpcRequest` scope with the bean factory and opens a new scope for every call, ahead of all other interceptors.
+It registers the `grpcRequest` scope with the bean factory and opens a new scope for every call, ahead of the other interceptors in the service chain.
+The beans of a call are destroyed when its `io.grpc.Context` is cancelled, which happens on completion as well as on cancellation, on the thread that completes the call.
 
 [source,java]
 ----
@@ -183,6 +184,7 @@ CallContext callContext() {
 
 NOTE: Accessing a request scoped bean outside of a call, or from a thread to which the call's `io.grpc.Context` has not been propagated, fails with a `ScopeNotActiveException`.
 
+[[reflection-service]]
 == Reflection
 
 Spring gRPC allows you to create an instance of the standard https://grpc.io/docs/guides/reflection/[gRPC Reflection service] which enables clients to browse the metadata of your services and download the Protobuf files.
