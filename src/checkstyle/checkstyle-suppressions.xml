@@ -5,6 +5,7 @@
 <suppressions>
 	<suppress files="package-info\.java" checks=".*" />
 	<suppress files="[\\/]test[\\/]" checks="RequireThis|AvoidStaticImport|Javadoc*" />
+	<suppress files="[\\/]generated-test-sources[\\/]" checks=".*"/>
 	<suppress files="Proto" checks=".*"/>
 	<suppress files=".*Tests" checks="HideUtilityClassConstructor" />
 	<suppress files=".*Tests" checks="RegexpSinglelineJava" id="toLowerCaseWithoutLocale"/>

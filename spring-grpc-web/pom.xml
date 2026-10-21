@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.springframework.grpc</groupId>
+		<artifactId>spring-grpc</artifactId>
+		<version>1.1.2-SNAPSHOT</version>
+	</parent>
+	<artifactId>spring-grpc-web</artifactId>
+	<packaging>jar</packaging>
+	<name>Spring gRPC Web</name>
+	<description>Web module for gRPC programming</description>
+
+	<properties>
+		<!-- just for tests -->
+		<protobuf-java.version>4.36.2</protobuf-java.version>
+		<grpc.version>1.84.1</grpc.version>
+	</properties>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.springframework</groupId>
+			<artifactId>spring-web</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.projectreactor</groupId>
+			<artifactId>reactor-core</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.jspecify</groupId>
+			<artifactId>jspecify</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.grpc</groupId>
+			<artifactId>grpc-api</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>com.google.protobuf</groupId>
+			<artifactId>protobuf-java</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.assertj</groupId>
+			<artifactId>assertj-core</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>io.projectreactor</groupId>
+			<artifactId>reactor-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>io.grpc</groupId>
+			<artifactId>grpc-stub</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>io.grpc</groupId>
+			<artifactId>grpc-protobuf</artifactId>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>io.github.ascopes</groupId>
+				<artifactId>protobuf-maven-plugin</artifactId>
+				<version>5.1.4</version>
+				<configuration>
+					<protoc>${protobuf-java.version}</protoc>
+				</configuration>
+				<executions>
+					<execution>
+						<id>test-protos</id>
+						<goals>
+							<goal>generate-test</goal>
+						</goals>
+						<configuration>
+							<plugins>
+								<plugin kind="binary-maven">
+									<groupId>io.grpc</groupId>
+									<artifactId>protoc-gen-grpc-java</artifactId>
+									<version>${grpc.version}</version>
+									<options>@generated=omit</options>
+								</plugin>
+							</plugins>
+							<sourceDirectories>
+								<sourceDirectory>src/test/proto</sourceDirectory>
+							</sourceDirectories>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+		</plugins>
+	</build>
+
+</project>
